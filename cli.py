@@ -182,14 +182,21 @@ def cmd_setup(
     cfg_path = save_config_file(save_values, hermes_home)
     _print(f"\n  ✓ Wrote forgetful config to {cfg_path}")
 
-    # Activate provider in hermes config.yaml
+    # Activate provider + register plugin skills dir in hermes config.yaml
     if hermes_config is not None:
         try:
             from hermes_cli.config import save_config
             mem = hermes_config.setdefault("memory", {})
             mem["provider"] = "forgetful"
+
+            # Register the plugin's skills/ as an external skills directory so
+            # the agent can discover encode-repo (and any future skills shipped
+            # with this plugin) automatically.
+            _register_skills_dir(hermes_config, hermes_home)
+
             save_config(hermes_config)
             _print("  ✓ memory.provider = 'forgetful' saved to hermes config.yaml")
+            _print("  ✓ plugin skills directory registered in skills.external_dirs")
         except Exception as exc:  # noqa: BLE001
             _print(f"  ⚠  Could not update hermes config.yaml: {exc}")
             _print("    Set memory.provider: forgetful manually.")
@@ -199,6 +206,35 @@ def cmd_setup(
     _print("    hermes forgetful search 'something you've discussed before'")
     _print("    hermes")
     _print()
+
+
+def _register_skills_dir(hermes_config: Dict[str, Any], hermes_home: str) -> None:
+    """Append the plugin's skills/ to ``skills.external_dirs`` (idempotent).
+
+    Hermes scans every directory in ``skills.external_dirs`` for SKILL.md
+    files at agent startup. Registering our plugin's skills/ here means
+    the encode-repo skill (and any future ones we ship) get picked up
+    automatically without the user copying files into ``~/.hermes/skills/``.
+    """
+    plugin_skills_dir = str(Path(hermes_home).resolve() / "plugins" / "forgetful" / "skills")
+    skills_section = hermes_config.setdefault("skills", {})
+    if not isinstance(skills_section, dict):
+        skills_section = {}
+        hermes_config["skills"] = skills_section
+    external = skills_section.setdefault("external_dirs", [])
+    if not isinstance(external, list):
+        external = []
+        skills_section["external_dirs"] = external
+
+    # Normalize for idempotency — compare resolved absolute paths.
+    target = str(Path(plugin_skills_dir).resolve())
+    for entry in external:
+        try:
+            if str(Path(str(entry)).expanduser().resolve()) == target:
+                return  # already registered
+        except (OSError, ValueError):
+            continue
+    external.append(plugin_skills_dir)
 
 
 def _ensure_project(

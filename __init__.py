@@ -18,6 +18,25 @@ Reference:
 
 from __future__ import annotations
 
+import sys as _sys
+
+# ── Workaround for hermes' user-plugin loader (sibling-module pre-load bug) ──
+# `~/.hermes/hermes-agent/plugins/memory/__init__.py::load_memory_provider`
+# iterates ``provider_dir.glob("*.py")`` alphabetically and exec's each file
+# in isolation BEFORE running our ``__init__.py``. When a sibling .py with
+# a relative import (e.g. ``cli.py``: ``from .client import ...``) loads
+# before its dependency, the exec raises ImportError — which the loader
+# silently caches as an empty stub in ``sys.modules`` (the ``except Exception``
+# only logs at debug level and never pops the broken entry). Any later
+# ``from .cli import cmd_setup`` then resolves to that empty shell and
+# raises "cannot import name 'cmd_setup'".
+#
+# Fix: evict every sibling-module entry under our package name BEFORE we
+# touch any of them. Python's regular import machinery then loads each
+# fresh in dependency order during our own top-level imports below.
+for _sub in ("cli", "client", "config", "context_gather", "explore"):
+    _sys.modules.pop(f"{__name__}.{_sub}", None)
+
 import json
 import logging
 import os

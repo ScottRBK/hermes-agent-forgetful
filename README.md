@@ -139,7 +139,9 @@ By default the embedded `uvx forgetful-ai` subprocess uses SQLite at `~/.local/s
 
 ## The repo encoder
 
-When you start using Forgetful with an existing codebase, you want a one-shot bootstrap: walk the repo, extract foundation memories, build an entity graph, capture the canonical patterns and a handful of code artifacts. That's `hermes forgetful encode`:
+When you start using Forgetful with an existing codebase, you want a one-shot bootstrap: walk the repo, extract foundation memories, build an entity graph, capture the canonical patterns and a handful of code artifacts. The encoder is exposed two ways — pick whichever fits your workflow:
+
+**From the shell (CLI)** — for users:
 
 ```bash
 # Dry-run first to see the rendered prompt
@@ -149,9 +151,17 @@ hermes forgetful encode ~/dev/my-project --dry-run
 hermes forgetful encode ~/dev/my-project --profile small
 ```
 
+**From inside a hermes session (skill)** — for the agent:
+
+The plugin ships an `encode-repo` skill, registered in `skills.external_dirs` by the setup wizard. Inside a hermes conversation you can ask the agent to encode a repo and it'll load the skill on demand:
+
+> "Encode the current repo into Forgetful at the small profile."
+
+Both paths share the same multi-phase pipeline (Foundation → Dependencies → Architecture → Entity Graph → Patterns → Features → Decisions → Code Artifacts → Architecture Document) — the CLI just spawns a clean `hermes -z` session that loads the same skill.
+
 Profiles (small / small_complex / medium / large) tune the memory budget per phase. Auto-detected from source-file count if you omit the flag.
 
-The encoder uses **whatever model your hermes is configured for** — no `--model` overrides, no haiku-tier selection. It runs the user's chosen model through eight (mostly mandatory) phases and prints a completion summary.
+The encoder uses **whatever model your hermes is configured for** — no `--model` overrides, no model-tier selection, no Anthropic-specific patterns. It runs your configured model through eight (mostly mandatory) phases and prints a completion summary.
 
 ## Configuration matrix
 
