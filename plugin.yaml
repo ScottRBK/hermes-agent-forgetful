@@ -1,0 +1,25 @@
+name: forgetful
+version: 0.1.0
+description: "Forgetful semantic memory — atomic Zettelkasten-style memories, knowledge-graph traversal, multi-source context gathering, and a multi-phase repo encoder. Backed by uvx forgetful-ai over stdio MCP."
+
+# pip dependencies installed by `hermes memory setup`. The Forgetful backend
+# itself is launched on demand via `uvx forgetful-ai` — no separate install.
+pip_dependencies:
+  - mcp
+
+# External dependencies discovered at install time.
+external_dependencies:
+  - name: uvx
+    install: "curl -LsSf https://astral.sh/uv/install.sh | sh"
+    check: "uvx --version"
+
+# Optional environment variables. None are strictly required (the backend
+# defaults to local SQLite). When set, these change behaviour:
+#   FORGETFUL_RECALL_MODE          hybrid (default) | context | tools
+#   FORGETFUL_PROJECT_ID           bind writes to a project; reads stay cross-project
+#   FORGETFUL_CONTEXT_TOKENS       cap on auto-injected recall (default 4000)
+#   FORGETFUL_BACKEND              sqlite (default) | postgres
+#   FORGETFUL_POSTGRES_*           postgres connection params (when backend=postgres)
+#   FORGETFUL_POSTGRES_PASSWORD    secret (kept in ~/.hermes/.env)
+#   CONTEXT7_API_KEY               optional companion for forgetful_gather_context
+requires_env: []
