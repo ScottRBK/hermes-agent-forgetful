@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/images/banner.png" alt="Forgetful Hermes Plugin" width="600">
+</p>
+
 # Forgetful Memory Provider for Hermes
 
 A [hermes-agent](https://github.com/NousResearch/hermes-agent) memory provider plugin backed by the [Forgetful](https://github.com/ScottRBK/forgetful) semantic-memory MCP server. Adds atomic Zettelkasten-style memories, knowledge-graph traversal, multi-source context gathering, and a multi-phase repo encoder to any hermes session — provider-agnostic, works with every model adapter hermes ships.
