@@ -17,9 +17,31 @@ import logging
 import os
 import subprocess
 import sys
+import types
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+# Hermes-agent's lightweight CLI scan
+# (``plugins/memory/__init__.py:discover_plugin_cli_commands``) imports
+# this module standalone via ``spec_from_file_location`` — without first
+# registering the parent package in ``sys.modules``. That breaks the
+# relative imports below ("attempted relative import with no known parent
+# package"). When ``__name__`` is dotted (i.e. we were loaded as a
+# submodule), synthesise a minimal parent stub with a correct ``__path__``
+# so Python's import machinery can resolve ``from .client import ...``.
+# When the plugin is loaded as a full package by ``_load_provider_from_dir``
+# (which DOES set up the parent), this branch is a no-op.
+if "." in __name__:
+    _parent_name = __name__.rsplit(".", 1)[0]
+    if _parent_name not in sys.modules:
+        _stub = types.ModuleType(_parent_name)
+        _stub.__path__ = [str(Path(__file__).resolve().parent)]
+        sys.modules[_parent_name] = _stub
+
+from ._install_paths import (
+    install_name_from_path,
+    register_skills_dir_in_config,
+)
 from .client import ForgetfulClient, ForgetfulClientError
 from .config import ForgetfulConfig, save_config_file
 
@@ -182,59 +204,38 @@ def cmd_setup(
     cfg_path = save_config_file(save_values, hermes_home)
     _print(f"\n  ✓ Wrote forgetful config to {cfg_path}")
 
+    # Hermes-agent's memory-provider discovery keys on the *directory name*
+    # under ``<hermes_home>/plugins/`` (see plugins/memory/__init__.py
+    # _iter_provider_dirs). When the user clones this plugin under the
+    # GitHub repo name (e.g. ``hermes-agent-forgetful``), we must write
+    # that actual dir name as ``memory.provider`` — writing the manifest
+    # ``name: forgetful`` instead would make discovery silently fail.
+    install_name = install_name_from_path(Path(__file__).parent)
+
     # Activate provider + register plugin skills dir in hermes config.yaml
     if hermes_config is not None:
         try:
             from hermes_cli.config import save_config
             mem = hermes_config.setdefault("memory", {})
-            mem["provider"] = "forgetful"
+            mem["provider"] = install_name
 
             # Register the plugin's skills/ as an external skills directory so
             # the agent can discover encode-repo (and any future skills shipped
             # with this plugin) automatically.
-            _register_skills_dir(hermes_config, hermes_home)
+            register_skills_dir_in_config(hermes_config, hermes_home, install_name)
 
             save_config(hermes_config)
-            _print("  ✓ memory.provider = 'forgetful' saved to hermes config.yaml")
+            _print(f"  ✓ memory.provider = '{install_name}' saved to hermes config.yaml")
             _print("  ✓ plugin skills directory registered in skills.external_dirs")
         except Exception as exc:  # noqa: BLE001
             _print(f"  ⚠  Could not update hermes config.yaml: {exc}")
-            _print("    Set memory.provider: forgetful manually.")
+            _print(f"    Set memory.provider: {install_name} manually.")
 
     _print("\n  Setup complete. Try:")
-    _print("    hermes forgetful status")
-    _print("    hermes forgetful search 'something you've discussed before'")
+    _print(f"    hermes {install_name} status")
+    _print(f"    hermes {install_name} search 'something you've discussed before'")
     _print("    hermes")
     _print()
-
-
-def _register_skills_dir(hermes_config: Dict[str, Any], hermes_home: str) -> None:
-    """Append the plugin's skills/ to ``skills.external_dirs`` (idempotent).
-
-    Hermes scans every directory in ``skills.external_dirs`` for SKILL.md
-    files at agent startup. Registering our plugin's skills/ here means
-    the encode-repo skill (and any future ones we ship) get picked up
-    automatically without the user copying files into ``~/.hermes/skills/``.
-    """
-    plugin_skills_dir = str(Path(hermes_home).resolve() / "plugins" / "forgetful" / "skills")
-    skills_section = hermes_config.setdefault("skills", {})
-    if not isinstance(skills_section, dict):
-        skills_section = {}
-        hermes_config["skills"] = skills_section
-    external = skills_section.setdefault("external_dirs", [])
-    if not isinstance(external, list):
-        external = []
-        skills_section["external_dirs"] = external
-
-    # Normalize for idempotency — compare resolved absolute paths.
-    target = str(Path(plugin_skills_dir).resolve())
-    for entry in external:
-        try:
-            if str(Path(str(entry)).expanduser().resolve()) == target:
-                return  # already registered
-        except (OSError, ValueError):
-            continue
-    external.append(plugin_skills_dir)
 
 
 def _ensure_project(
