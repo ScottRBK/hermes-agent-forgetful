@@ -31,12 +31,15 @@ from typing import Any, Dict, List, Optional
 # so Python's import machinery can resolve ``from .client import ...``.
 # When the plugin is loaded as a full package by ``_load_provider_from_dir``
 # (which DOES set up the parent), this branch is a no-op.
+_parent_name: Optional[str] = None
+_we_created_stub = False
 if "." in __name__:
     _parent_name = __name__.rsplit(".", 1)[0]
     if _parent_name not in sys.modules:
         _stub = types.ModuleType(_parent_name)
         _stub.__path__ = [str(Path(__file__).resolve().parent)]
         sys.modules[_parent_name] = _stub
+        _we_created_stub = True
 
 from ._install_paths import (
     install_name_from_path,
@@ -44,6 +47,17 @@ from ._install_paths import (
 )
 from .client import ForgetfulClient, ForgetfulClientError
 from .config import ForgetfulConfig, save_config_file
+
+# Drop the stub now that our own relative imports have resolved.
+# Hermes-agent's ``_load_provider_from_dir`` checks ``sys.modules`` for the
+# parent name and short-circuits when it finds an entry — so a leftover stub
+# means it would skip executing ``__init__.py`` and never instantiate the
+# provider (manifests as: "Memory provider 'X' loaded but no provider
+# instance found"). Popping the stub is safe because the dotted children
+# already loaded — they keep working via their own sys.modules entries —
+# and ``__init__.py`` rebuilds the parent fresh on the next load.
+if _we_created_stub and _parent_name is not None:
+    sys.modules.pop(_parent_name, None)
 
 logger = logging.getLogger(__name__)
 

@@ -472,8 +472,16 @@ class ForgetfulMemoryProvider(MemoryProvider):
 
         ``context`` mode hides all tools (auto-injected context only).
         ``tools`` and ``hybrid`` modes both expose the full surface.
+
+        Liveness is *deliberately* not checked here. Hermes-agent calls
+        this from ``MemoryManager.add_provider`` to populate the dispatch
+        routing table — which runs before ``initialize()`` starts the
+        subprocess. Gating on ``_client`` would leave the table empty and
+        the LLM unable to dispatch. The runtime liveness check belongs in
+        ``handle_tool_call``, which already returns ``tool_error`` when
+        the provider is inactive.
         """
-        if self._is_inactive() or self._recall_mode == "context":
+        if self._recall_mode == "context":
             return []
         return list(_BASIC_TOOL_SCHEMAS) + [EXPLORE_SCHEMA, GATHER_SCHEMA]
 
