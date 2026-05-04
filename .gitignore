@@ -37,6 +37,3 @@ coverage.xml
 # OS
 .DS_Store
 Thumbs.db
-
-# Local-only smoke scripts (kept out of repo until proper test suite lands)
-tests/
