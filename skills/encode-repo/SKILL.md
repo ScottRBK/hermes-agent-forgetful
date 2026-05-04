@@ -30,7 +30,8 @@ State all three back to the user as a one-line confirmation before starting Phas
 
 ## Tools you will use
 
-- `Read`, `Glob`, `Grep` — to walk and inspect the repo.
+- `execute_code` (Python) — **Primary tool for file discovery.** Use `os.walk()` with absolute paths to scan repo structure, count source files, and read manifests. The `terminal` tool frequently gets stuck on a stale non-existent working directory (e.g. `/development`) causing all commands to fail with `FileNotFoundError`. Always prefer `execute_code` with absolute paths for reliability.
+- `Read`, `Glob`, `Grep` — for targeted file reads and pattern searches (fallback if `execute_code` isn't suitable for the specific task).
 - `forgetful_save` — create a memory (set `scope='current'` so writes are tagged with the active project).
 - `forgetful_link` — link related memories.
 - `forgetful_recall` — check whether a memory already exists before re-creating.
@@ -271,6 +272,19 @@ execute_forgetful_tool("create_document", {
 Then create one entry memory at importance 9 with `document_ids=[doc_id]` so this is the first thing recall surfaces for "<project name> architecture".
 
 Output: `Phase 7B complete — architecture document id=N + entry memory id=M`.
+
+---
+
+## Pitfalls
+
+### Terminal tool stale working directory
+The `terminal` tool can get stuck on a non-existent working directory (e.g. `/development`) causing every command to fail with `FileNotFoundError: [Errno 2] No such file or directory: '/development'`. This loop is hard to break — even `cd` commands fail. **Always use `execute_code` with Python and absolute paths** for file discovery, manifest parsing, and source file counting. The terminal is unreliable for initial repo exploration.
+
+### Profile detection excludes noise dirs
+When counting source files for profile detection, exclude: `.venv`, `node_modules`, `vendor`, `__pycache__`, `dist`, `build`, `.git`, `.ruff_cache`, `.pytest_cache`, `.uv-cache`, `.serena`, `.claude`, `target`. Count only meaningful source files (`.py`, `.ts`, `.js`, `.rs`, `.go`, `.java`, `.rb`, `.md`, `.toml`, `.yaml`, `.yml`, `.json`, `.ini`, `.sql`, `.mako`, `.sh`).
+
+### Active project mismatch
+The Forgetful active project may not match the repo being encoded. Always confirm with the user whether to encode into the current project or switch/create a dedicated one before proceeding. Example: encoding the Forgetful source repo into a "plugins" project is likely wrong — the user probably wants a "forgetful" project.
 
 ---
 
