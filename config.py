@@ -72,10 +72,6 @@ class ForgetfulConfig:
     recall_mode: str = "hybrid"
     context_tokens: int = 4000
 
-    # Project scoping
-    project_id: Optional[int] = None
-    project_name: Optional[str] = None
-
     # Subprocess
     forgetful_command: str = "uvx"
     forgetful_args: list[str] = field(default_factory=lambda: ["forgetful-ai"])
@@ -131,10 +127,6 @@ class ForgetfulConfig:
             self.recall_mode = v
         if v := env.get("FORGETFUL_CONTEXT_TOKENS"):
             self.context_tokens = _coerce_int(v, self.context_tokens) or self.context_tokens
-        if v := env.get("FORGETFUL_PROJECT_ID"):
-            self.project_id = _coerce_int(v, self.project_id)
-        if v := env.get("FORGETFUL_PROJECT_NAME"):
-            self.project_name = v
         if v := env.get("FORGETFUL_COMMAND"):
             self.forgetful_command = v
         if v := env.get("FORGETFUL_ARGS"):

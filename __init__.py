@@ -93,7 +93,7 @@ RECALL_SCHEMA = {
     "description": (
         "Semantic search over the Forgetful knowledge base. Returns memories "
         "ranked by relevance with optional linked-memory context. Cross-project "
-        "by default — set scope='current' to limit to the active project."
+        "by default — pass project_ids to restrict the search."
     ),
     "parameters": {
         "type": "object",
@@ -110,10 +110,14 @@ RECALL_SCHEMA = {
                 "type": "integer",
                 "description": "Number of primary results to return (1-20, default 5).",
             },
-            "scope": {
-                "type": "string",
-                "enum": ["all", "current"],
-                "description": "Project scope. 'all' (default) searches every project; 'current' restricts to the active project.",
+            "project_ids": {
+                "type": "array",
+                "items": {"type": "integer"},
+                "description": (
+                    "Optional list of project ids to restrict the search to. "
+                    "When omitted (default), recall is cross-project — search "
+                    "every project the user has."
+                ),
             },
             "include_links": {
                 "type": "boolean",
@@ -134,7 +138,9 @@ SAVE_SCHEMA = {
         "Persist a single atomic memory in Forgetful. Use for non-obvious "
         "decisions, durable patterns, surprising learnings, or facts worth "
         "recalling in future sessions. One concept per memory — keep it tight. "
-        "Tagged with the active project unless scope='none'."
+        "Pass `project` (name or id) to file the memory in a specific project; "
+        "omit it to save global (visible from every project's recall). Use "
+        "forgetful_projects first if you need to list or create a project."
     ),
     "parameters": {
         "type": "object",
@@ -165,13 +171,50 @@ SAVE_SCHEMA = {
                 "type": "integer",
                 "description": "Importance score (1-10, default 7). 9-10=foundational, 7-8=useful pattern.",
             },
-            "scope": {
-                "type": "string",
-                "enum": ["current", "none"],
-                "description": "Project scoping. 'current' (default) tags with the active project; 'none' leaves the memory unscoped (visible to all projects).",
+            "project": {
+                "type": ["string", "integer"],
+                "description": (
+                    "Optional. Project name (string) or id (integer) to file "
+                    "this memory under. Omit to save global (no project tag). "
+                    "Names are resolved via list_projects — unknown names "
+                    "return an error so the agent can call forgetful_projects "
+                    "to create the project explicitly."
+                ),
             },
         },
         "required": ["title", "content", "context"],
+    },
+}
+
+PROJECTS_SCHEMA = {
+    "name": "forgetful_projects",
+    "description": (
+        "List or create Forgetful projects. Default: returns the current "
+        "project list (id, name, description). Pass `create` with a "
+        "{name, description} object to create a new project — call this "
+        "before forgetful_save when filing a memory under a project that "
+        "doesn't exist yet. Memories are organised by project; the agent "
+        "decides per-save which project (if any) a memory belongs in."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "create": {
+                "type": "object",
+                "description": "When provided, creates a new project instead of listing.",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "Project name (used as the resolution key for forgetful_save's `project` field).",
+                    },
+                    "description": {
+                        "type": "string",
+                        "description": "What this project covers — shown in listings and used for disambiguation.",
+                    },
+                },
+                "required": ["name", "description"],
+            },
+        },
     },
 }
 
@@ -226,7 +269,13 @@ OBSOLETE_SCHEMA = {
 }
 
 
-_BASIC_TOOL_SCHEMAS = [RECALL_SCHEMA, SAVE_SCHEMA, LINK_SCHEMA, OBSOLETE_SCHEMA]
+_BASIC_TOOL_SCHEMAS = [
+    RECALL_SCHEMA,
+    SAVE_SCHEMA,
+    LINK_SCHEMA,
+    OBSOLETE_SCHEMA,
+    PROJECTS_SCHEMA,
+]
 
 
 EXPLORE_SCHEMA = {
@@ -308,6 +357,14 @@ class ForgetfulMemoryProvider(MemoryProvider):
         # Recall mode (set in initialize from config)
         self._recall_mode: str = "hybrid"
 
+        # Project awareness: a session-scoped cache of available projects
+        # and an optional cwd-based hint. Populated at initialize time and
+        # refreshed when the agent creates a project mid-session. Used
+        # only by ``system_prompt_block`` for ambient awareness — saves
+        # always resolve the project at call time, never from this cache.
+        self._projects_cache: List[Dict[str, Any]] = []
+        self._cwd_project_id: Optional[int] = None
+
         # Per-turn caches
         self._prefetch_lock = threading.Lock()
         self._prefetch_thread: Optional[threading.Thread] = None
@@ -380,9 +437,11 @@ class ForgetfulMemoryProvider(MemoryProvider):
             return
 
         self._client = client
+        self._refresh_projects_cache()
+        self._cwd_project_id = self._detect_cwd_project_hint()
         logger.info(
-            "forgetful: initialized (mode=%s project_id=%s backend=%s)",
-            cfg.recall_mode, cfg.project_id, cfg.backend,
+            "forgetful: initialized (mode=%s projects=%d cwd_hint=%s backend=%s)",
+            cfg.recall_mode, len(self._projects_cache), self._cwd_project_id, cfg.backend,
         )
 
     # -- config + setup ----------------------------------------------------
@@ -390,10 +449,11 @@ class ForgetfulMemoryProvider(MemoryProvider):
     def get_config_schema(self) -> List[Dict[str, Any]]:
         """Schema fields surfaced by ``hermes memory setup``.
 
-        Recall mode, project bind, and the optional Context7 companion key.
-        Database/transport tuning lives in ``forgetful.json`` — surfaced via
-        the standalone ``hermes forgetful setup`` wizard, not the generic
-        memory picker.
+        Recall mode and the optional Context7 companion key. There is no
+        sticky project binding — the agent picks a project per-save.
+        Database/transport tuning lives in ``forgetful.json`` — surfaced
+        via the standalone ``hermes forgetful setup`` wizard, not the
+        generic memory picker.
         """
         return [
             {
@@ -401,10 +461,6 @@ class ForgetfulMemoryProvider(MemoryProvider):
                 "description": "Recall mode: hybrid (auto context + tools), context (auto-inject only), tools (CRUD only).",
                 "default": "hybrid",
                 "choices": ["hybrid", "context", "tools"],
-            },
-            {
-                "key": "project_name",
-                "description": "Forgetful project name (leave blank to skip project binding).",
             },
             {
                 "key": "context7_api_key",
@@ -446,15 +502,37 @@ class ForgetfulMemoryProvider(MemoryProvider):
     def _is_inactive(self) -> bool:
         return self._cron_skipped or self._client is None or not self._client.is_alive()
 
-    def _project_ids_filter(self, scope: str) -> Optional[List[int]]:
-        """Resolve a project_ids filter from a 'scope' arg.
+    def _resolve_project(self, value: Any) -> int:
+        """Resolve ``value`` (project name or id) to a project id.
 
-        ``scope='current'`` → [project_id] when configured, else None.
-        ``scope='all'`` → None (cross-project recall — the default).
+        - ``int``: returned as-is.
+        - ``str`` of digits: parsed as id.
+        - ``str``: looked up by name via ``list_projects``. Raises
+          ``ValueError`` when no project matches — the caller is expected
+          to surface this as a ``tool_error`` so the agent can decide
+          whether to create the project explicitly.
         """
-        if scope == "current" and self._config and self._config.project_id is not None:
-            return [self._config.project_id]
-        return None
+        if isinstance(value, bool):
+            raise ValueError(f"project must be a name or id, got bool")
+        if isinstance(value, int):
+            return value
+        if isinstance(value, str):
+            text = value.strip()
+            if not text:
+                raise ValueError("project name is empty")
+            if text.isdigit():
+                return int(text)
+            listing = self._execute("list_projects", {})
+            for p in (listing.get("projects") or []):
+                if isinstance(p, dict) and p.get("name") == text:
+                    return int(p["id"])
+            raise ValueError(
+                f"unknown project name {text!r} — call forgetful_projects to "
+                "list current projects or create=... to add a new one"
+            )
+        raise ValueError(
+            f"project must be a name (string) or id (integer), got {type(value).__name__}"
+        )
 
     def _execute(self, tool_name: str, args: Dict[str, Any]) -> Dict[str, Any]:
         """Call a forgetful MCP tool via the meta-tool dispatcher."""
@@ -502,6 +580,8 @@ class ForgetfulMemoryProvider(MemoryProvider):
                 return self._handle_link(args)
             if tool_name == "forgetful_obsolete":
                 return self._handle_obsolete(args)
+            if tool_name == "forgetful_projects":
+                return self._handle_projects(args)
             if tool_name == "forgetful_gather_context":
                 return self._handle_gather_context(args)
             if tool_name == "forgetful_explore":
@@ -521,7 +601,6 @@ class ForgetfulMemoryProvider(MemoryProvider):
         if not query:
             return tool_error("forgetful_recall: 'query' is required")
 
-        scope = args.get("scope") or "all"
         payload: Dict[str, Any] = {
             "query": query,
             "query_context": args.get("query_context") or "agent recall",
@@ -531,10 +610,12 @@ class ForgetfulMemoryProvider(MemoryProvider):
         if (importance := args.get("importance_min")) is not None:
             payload["importance_threshold"] = _clamp_int(importance, default=1, lo=1, hi=10)
 
-        proj_filter = self._project_ids_filter(scope)
-        if proj_filter is not None:
-            payload["project_ids"] = proj_filter
-            payload["strict_project_filter"] = True
+        raw_pids = args.get("project_ids")
+        if isinstance(raw_pids, list) and raw_pids:
+            coerced = [pid for pid in (_coerce_int(v) for v in raw_pids) if pid is not None]
+            if coerced:
+                payload["project_ids"] = coerced
+                payload["strict_project_filter"] = True
 
         result = self._execute("query_memory", payload)
         return json.dumps(result, default=str)
@@ -557,7 +638,6 @@ class ForgetfulMemoryProvider(MemoryProvider):
                 f"forgetful_save: content exceeds 2000 char limit (got {len(content)})"
             )
 
-        scope = args.get("scope") or "current"
         keywords = _coerce_str_list(args.get("keywords"), max_len=10)
         tags = _coerce_str_list(args.get("tags"), max_len=10)
 
@@ -570,10 +650,41 @@ class ForgetfulMemoryProvider(MemoryProvider):
             "importance": _clamp_int(args.get("importance"), default=7, lo=1, hi=10),
             "encoding_agent": ENCODING_AGENT_TAG,
         }
-        if scope == "current" and self._config and self._config.project_id is not None:
-            payload["project_ids"] = [self._config.project_id]
+
+        project = args.get("project")
+        if project is not None:
+            try:
+                payload["project_ids"] = [self._resolve_project(project)]
+            except ValueError as exc:
+                return tool_error(f"forgetful_save: {exc}")
 
         result = self._execute("create_memory", payload)
+        return json.dumps(result, default=str)
+
+    def _handle_projects(self, args: Dict[str, Any]) -> str:
+        """List existing projects, or create one when ``create`` is provided.
+
+        Default (no args) returns the project list. Pass ``create``: a
+        ``{name, description}`` object to create a new project — the
+        plugin invalidates its prompt-block cache on success so the new
+        project shows up next turn.
+        """
+        create = args.get("create")
+        if isinstance(create, dict):
+            name = (create.get("name") or "").strip()
+            description = (create.get("description") or "").strip()
+            if not name:
+                return tool_error("forgetful_projects: create.name is required")
+            if not description:
+                return tool_error("forgetful_projects: create.description is required")
+            result = self._execute(
+                "create_project",
+                {"name": name, "description": description, "project_type": "development"},
+            )
+            self._refresh_projects_cache()
+            return json.dumps(result, default=str)
+
+        result = self._execute("list_projects", {})
         return json.dumps(result, default=str)
 
     def _handle_link(self, args: Dict[str, Any]) -> str:
@@ -601,12 +712,14 @@ class ForgetfulMemoryProvider(MemoryProvider):
         """Return a static, mode-adapted Forgetful header for the system prompt.
 
         Empty under cron/inactive. Cache-friendly: contains no per-turn
-        context (live recall is injected via ``prefetch()``).
+        context (live recall is injected via ``prefetch()``). Lists the
+        available projects so the agent can pick one when calling
+        ``forgetful_save`` — projects are not sticky; every save is an
+        explicit per-call decision.
         """
         if self._is_inactive():
             return ""
 
-        scope_line = self._scope_summary()
         tool_names = [s["name"] for s in self.get_tool_schemas()]
         tool_list = ", ".join(tool_names) if tool_names else "(no tools active)"
 
@@ -628,26 +741,86 @@ class ForgetfulMemoryProvider(MemoryProvider):
                 f"saving, linking, and curation: {tool_list}."
             )
 
-        return (
-            "# Forgetful Memory\n"
-            f"Active. {body}\n"
-            f"{scope_line}"
-        ).rstrip()
+        projects_block = self._format_projects_block()
 
-    def _scope_summary(self) -> str:
-        if not self._config:
+        parts = [
+            "# Forgetful Memory",
+            f"Active. {body}",
+        ]
+        if projects_block:
+            parts.append(projects_block)
+        return "\n".join(parts).rstrip()
+
+    def _format_projects_block(self) -> str:
+        """Render the available-projects list for the system prompt.
+
+        Empty when no projects exist or tools are hidden (context-only mode
+        — agent can't act on the list anyway). Marks the cwd-matched
+        project with ``← matches current directory`` so the agent knows
+        which one is the most likely target without us forcing the choice.
+        """
+        if self._recall_mode == "context":
             return ""
-        if self._config.project_id is not None:
-            project = self._config.project_name or f"id={self._config.project_id}"
+        if not self._projects_cache:
             return (
-                f"Active project: **{project}** — writes are tagged with this "
-                "project; reads search across all projects unless you set scope='current'."
+                "## Forgetful projects\n"
+                "_No projects yet. Call `forgetful_projects` with `create={\"name\":..., "
+                "\"description\":...}` to add one before saving project-scoped memories."
             )
-        return (
-            "No active project set. Writes are unscoped; reads search across "
-            "all projects. Run `hermes forgetful setup` to bind this directory "
-            "to a project."
+        lines = ["## Forgetful projects"]
+        for p in self._projects_cache:
+            if not isinstance(p, dict):
+                continue
+            pid = p.get("id")
+            name = p.get("name") or "(unnamed)"
+            marker = " ← matches current directory" if pid == self._cwd_project_id else ""
+            lines.append(f"- **{name}** (id={pid}){marker}")
+        lines.append(
+            "Saves default to global (no project). Pass `project: <name|id>` to "
+            "`forgetful_save` to file under one of the above."
         )
+        return "\n".join(lines)
+
+    def _refresh_projects_cache(self) -> None:
+        """Pull the current project list and cache it for the prompt block.
+
+        Errors are swallowed at debug level — the cache stays empty and
+        the prompt simply tells the agent there are no projects yet.
+        Called once at initialize and again whenever the agent creates a
+        project via ``forgetful_projects``.
+        """
+        if self._client is None:
+            return
+        try:
+            res = self._execute("list_projects", {})
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("forgetful: project cache refresh failed: %s", exc)
+            return
+        projects = res.get("projects") if isinstance(res, dict) else None
+        if isinstance(projects, list):
+            self._projects_cache = [p for p in projects if isinstance(p, dict)]
+
+    def _detect_cwd_project_hint(self) -> Optional[int]:
+        """Return the id of a project whose name matches this cwd, if any.
+
+        Reads the current working directory's git remote 'origin' URL,
+        derives a candidate project name (e.g. ``foo`` from
+        ``git@github.com:user/foo.git``), and returns the matching cached
+        project's id. None when there's no remote, no match, or git is
+        unavailable.
+        """
+        if not self._projects_cache:
+            return None
+        candidate = _project_name_from_cwd()
+        if not candidate:
+            return None
+        for p in self._projects_cache:
+            name = p.get("name") if isinstance(p, dict) else None
+            if isinstance(name, str) and name == candidate:
+                pid = _coerce_int(p.get("id"))
+                if pid is not None:
+                    return pid
+        return None
 
     # -- prefetch / queue_prefetch ----------------------------------------
 
@@ -842,8 +1015,6 @@ class ForgetfulMemoryProvider(MemoryProvider):
             "importance": 5,
             "encoding_agent": ENCODING_AGENT_TAG,
         }
-        if self._config and self._config.project_id is not None:
-            payload["project_ids"] = [self._config.project_id]
 
         def _sync() -> None:
             try:
@@ -998,6 +1169,33 @@ def _make_turn_content(user_content: str, assistant_content: str, *, max_total: 
     if truncated_assistant:
         parts.append(f"Assistant: {truncated_assistant}")
     return "\n\n".join(parts)[:max_total]
+
+
+def _project_name_from_cwd() -> Optional[str]:
+    """Derive a candidate project name from the current cwd's git remote.
+
+    Returns ``None`` when git isn't available, no remote is configured,
+    or the URL doesn't parse. Used only as a soft hint for the system
+    prompt — never as enforcement.
+    """
+    import subprocess
+    try:
+        result = subprocess.run(
+            ["git", "remote", "get-url", "origin"],
+            capture_output=True, text=True, timeout=2,
+        )
+    except (FileNotFoundError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    url = (result.stdout or "").strip()
+    if not url:
+        return None
+    name = url.rstrip("/")
+    if name.endswith(".git"):
+        name = name[:-4]
+    name = name.split("/")[-1]
+    return name or None
 
 
 def _coerce_str_list(value: Any, *, max_len: int) -> List[str]:

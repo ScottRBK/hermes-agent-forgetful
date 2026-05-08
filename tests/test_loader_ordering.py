@@ -126,7 +126,8 @@ def test_provider_loads_after_cli_scan_pre_populates_sys_modules(install_layout,
     schemas = provider.get_tool_schemas()
     names = {s["name"] for s in schemas}
     assert "forgetful_save" in names
-    assert len(names) == 6
+    assert "forgetful_projects" in names
+    assert len(names) == 7
 
 
 def test_cli_scan_alone_does_not_leave_parent_stub_in_sys_modules(install_layout, tmp_path):

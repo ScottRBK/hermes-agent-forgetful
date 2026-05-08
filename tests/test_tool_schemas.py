@@ -76,6 +76,7 @@ _EXPECTED_TOOL_NAMES = {
     "forgetful_save",
     "forgetful_link",
     "forgetful_obsolete",
+    "forgetful_projects",
     "forgetful_explore",
     "forgetful_gather_context",
 }

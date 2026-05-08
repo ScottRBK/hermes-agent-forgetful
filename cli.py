@@ -3,11 +3,15 @@
 Two entry points:
 - ``cmd_setup`` is invoked by ``hermes memory setup`` (via the provider's
   ``post_setup`` hook) AND by ``hermes forgetful setup``.
-- ``register_cli(subparser)`` wires the runtime commands (status, project,
+- ``register_cli(subparser)`` wires the runtime commands (status, projects,
   search, save, list, gather, explore, encode, reset) into argparse.
 
 Higher-level commands (gather, explore, encode) delegate to the modules
 that own them so this file stays a thin dispatcher.
+
+Project model: there is no "current project" sticky state. The agent or
+CLI user chooses a project per save; ``forgetful_projects`` (or
+``hermes forgetful projects``) lists / creates them.
 """
 
 from __future__ import annotations
@@ -121,17 +125,6 @@ def _detect_git_remote(cwd: Path) -> Optional[str]:
     return url or None
 
 
-def _project_name_from_remote(url: str) -> Optional[str]:
-    """Extract repo name from common git URL forms."""
-    if not url:
-        return None
-    name = url.rstrip("/")
-    if name.endswith(".git"):
-        name = name[:-4]
-    name = name.split("/")[-1]
-    return name or None
-
-
 # ---------------------------------------------------------------------------
 # Setup wizard
 # ---------------------------------------------------------------------------
@@ -146,8 +139,11 @@ def cmd_setup(
     Walks the user through:
       1. uvx availability check
       2. recall mode selection
-      3. project binding (detect git remote → match existing or create)
-      4. forgetful.json + hermes config.yaml persistence
+      3. forgetful.json + hermes config.yaml persistence
+
+    No project prompt — the agent picks a project per save at runtime.
+    Run ``hermes forgetful projects create <name>`` separately if you
+    want to seed a project ahead of time.
 
     Falls back to non-interactive defaults under ``not sys.stdin.isatty()``
     (CI / scripted setup).
@@ -172,48 +168,10 @@ def cmd_setup(
         default=cfg_existing.recall_mode or "hybrid",
     )
 
-    # Project binding
-    cwd = Path.cwd()
-    remote = _detect_git_remote(cwd)
-    default_project_name = (
-        cfg_existing.project_name
-        or _project_name_from_remote(remote or "")
-        or cwd.name
-    )
-    project_name = _prompt(
-        "Project name (blank to skip project binding)",
-        default=default_project_name,
-    ).strip()
-
-    project_id: Optional[int] = None
-    if project_name:
-        _print(f"\n  Connecting to forgetful-ai (uvx) — first run installs the package…")
-        client = ForgetfulClient(
-            command=cfg_existing.forgetful_command,
-            args=list(cfg_existing.forgetful_args),
-            env=cfg_existing.subprocess_env(),
-            startup_timeout=max(cfg_existing.startup_timeout, 90.0),
-        )
-        try:
-            client.start()
-            project_id = _ensure_project(client, project_name, remote)
-            _print(f"  ✓ Bound to project: {project_name} (id={project_id})")
-        except ForgetfulClientError as exc:
-            _print(f"  ✗ Could not connect to forgetful-ai: {exc}")
-            _print("    Continuing without a project binding — you can re-run "
-                   "`hermes forgetful project switch <name>` later.")
-        finally:
-            client.close()
-    else:
-        _print("\n  Skipping project binding (writes will be unscoped).")
-
     # Persist forgetful.json
     save_values: Dict[str, Any] = {
         "recall_mode": recall_mode,
     }
-    if project_id is not None:
-        save_values["project_id"] = project_id
-        save_values["project_name"] = project_name
 
     cfg_path = save_config_file(save_values, hermes_home)
     _print(f"\n  ✓ Wrote forgetful config to {cfg_path}")
@@ -256,6 +214,8 @@ def _ensure_project(
     client: ForgetfulClient,
     name: str,
     remote: Optional[str],
+    *,
+    description: Optional[str] = None,
 ) -> int:
     """Return the id of project *name*, creating it if it doesn't exist."""
     listing = client.execute("execute_forgetful_tool", {
@@ -267,11 +227,12 @@ def _ensure_project(
         if isinstance(p, dict) and p.get("name") == name:
             return int(p["id"])
 
-    description = (
-        f"Auto-created by hermes forgetful setup for {remote}"
-        if remote else
-        "Auto-created by hermes forgetful setup"
-    )
+    if description is None:
+        description = (
+            f"Auto-created by hermes forgetful for {remote}"
+            if remote else
+            "Auto-created by hermes forgetful"
+        )
     created = client.execute("execute_forgetful_tool", {
         "tool_name": "create_project",
         "arguments": {
@@ -287,6 +248,28 @@ def _ensure_project(
             f"create_project response missing 'id': {created}"
         )
     return int(pid)
+
+
+def _resolve_project_arg(client: ForgetfulClient, value: str) -> int:
+    """Resolve a CLI project arg (name or numeric string) to an id.
+
+    Mirrors the in-process resolver in ``__init__.py:_resolve_project``,
+    but uses the short-lived CLI client. Raises ``ForgetfulClientError``
+    when the name doesn't match any existing project.
+    """
+    text = value.strip()
+    if text.isdigit():
+        return int(text)
+    listing = client.execute("execute_forgetful_tool", {
+        "tool_name": "list_projects",
+        "arguments": {},
+    })
+    for p in (listing.get("projects") or []):
+        if isinstance(p, dict) and p.get("name") == text:
+            return int(p["id"])
+    raise ForgetfulClientError(
+        f"unknown project {text!r} — `hermes forgetful projects list` to see what exists"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -323,8 +306,6 @@ def cmd_status(args) -> None:
     _print("  ────────────────")
     _print(f"  HERMES_HOME:  {home}")
     _print(f"  Recall mode:  {cfg.recall_mode}")
-    _print(f"  Project:      {cfg.project_name or '(unset)'} "
-           f"(id={cfg.project_id if cfg.project_id is not None else '—'})")
     _print(f"  Backend:      {cfg.backend}")
     _print(f"  Command:      {cfg.forgetful_command} {' '.join(cfg.forgetful_args)}")
     _print(f"  Context7:     {'enabled (CONTEXT7_API_KEY set)' if cfg.context7_enabled else 'disabled'}")
@@ -338,13 +319,12 @@ def cmd_status(args) -> None:
     try:
         meta = client.execute("discover_forgetful_tools", {})
         _print(f"  ✓ Connected — {meta.get('total_count', '?')} backend tools available")
-        if cfg.project_id is not None:
-            recent = client.execute("execute_forgetful_tool", {
-                "tool_name": "get_recent_memories",
-                "arguments": {"limit": 5, "project_ids": [cfg.project_id]},
-            })
-            mems = _extract_memory_list(recent)
-            _print(f"  ✓ {len(mems)} recent memories in project")
+        projects_res = client.execute("execute_forgetful_tool", {
+            "tool_name": "list_projects",
+            "arguments": {},
+        })
+        projects = projects_res.get("projects") or []
+        _print(f"  ✓ {len(projects)} project(s) available")
     except ForgetfulClientError as exc:
         _print(f"  ⚠ Probe failed: {exc}")
     finally:
@@ -352,18 +332,16 @@ def cmd_status(args) -> None:
     _print()
 
 
-def cmd_project(args) -> None:
-    """Show / switch / list forgetful projects."""
+def cmd_projects(args) -> None:
+    """List or create Forgetful projects.
+
+    Subcommands:
+      list                    — show every project (default)
+      create <name> [desc]    — create a new project
+    """
     home = _resolve_hermes_home()
     cfg = ForgetfulConfig.load(home)
-    sub = (args.project_command or "show").lower()
-
-    if sub == "show":
-        if cfg.project_id is None:
-            _print("\n  No project bound. Run `hermes forgetful project switch <name>`.\n")
-            return
-        _print(f"\n  Active project: {cfg.project_name} (id={cfg.project_id})\n")
-        return
+    sub = (args.projects_command or "list").lower()
 
     if sub == "list":
         client = _open_client(cfg)
@@ -377,28 +355,36 @@ def cmd_project(args) -> None:
             client.close()
         _print()
         if not projects:
-            _print("  (no projects)")
+            _print("  (no projects — `hermes forgetful projects create <name>` to add one)")
         for p in projects:
-            marker = " *" if isinstance(p, dict) and p.get("id") == cfg.project_id else "  "
-            _print(f"  {marker}{p.get('id'):>4}  {p.get('name')}  — {p.get('description', '')[:60]}")
+            if not isinstance(p, dict):
+                continue
+            description = (p.get("description") or "")[:60]
+            _print(f"   {p.get('id'):>4}  {p.get('name')}  — {description}")
         _print()
         return
 
-    if sub == "switch":
-        name = args.project_name
+    if sub == "create":
+        name = (args.name or "").strip()
         if not name:
-            _print("\n  Usage: hermes forgetful project switch <name>\n")
+            _print("\n  Usage: hermes forgetful projects create <name> [--description ...]\n")
             return
+        description = (
+            args.description
+            or f"Created via hermes forgetful CLI on {Path.cwd()}"
+        )
         client = _open_client(cfg)
         try:
-            pid = _ensure_project(client, name, _detect_git_remote(Path.cwd()))
+            pid = _ensure_project(
+                client, name, _detect_git_remote(Path.cwd()),
+                description=description,
+            )
         finally:
             client.close()
-        save_config_file({"project_id": pid, "project_name": name}, home)
-        _print(f"\n  ✓ Switched to project: {name} (id={pid})\n")
+        _print(f"\n  ✓ Created project: {name} (id={pid})\n")
         return
 
-    _print(f"\n  Unknown project subcommand: {sub}\n")
+    _print(f"\n  Unknown projects subcommand: {sub}\n")
 
 
 def cmd_search(args) -> None:
@@ -416,12 +402,18 @@ def cmd_search(args) -> None:
         "k": max(1, min(args.k or 5, 20)),
         "include_links": True,
     }
-    if args.scope == "current" and cfg.project_id is not None:
-        payload["project_ids"] = [cfg.project_id]
-        payload["strict_project_filter"] = True
 
     client = _open_client(cfg)
     try:
+        if args.project:
+            try:
+                pid = _resolve_project_arg(client, args.project)
+            except ForgetfulClientError as exc:
+                _print(f"\n  ✗ {exc}\n")
+                client.close()
+                return
+            payload["project_ids"] = [pid]
+            payload["strict_project_filter"] = True
         res = client.execute("execute_forgetful_tool", {
             "tool_name": "query_memory",
             "arguments": payload,
@@ -486,11 +478,17 @@ def cmd_save(args) -> None:
         "importance": max(1, min(importance, 10)),
         "encoding_agent": "hermes-cli/forgetful-plugin",
     }
-    if cfg.project_id is not None:
-        payload["project_ids"] = [cfg.project_id]
 
     client = _open_client(cfg)
     try:
+        if args.project:
+            try:
+                pid = _resolve_project_arg(client, args.project)
+            except ForgetfulClientError as exc:
+                _print(f"\n  ✗ {exc}\n")
+                client.close()
+                return
+            payload["project_ids"] = [pid]
         res = client.execute("execute_forgetful_tool", {
             "tool_name": "create_memory",
             "arguments": payload,
@@ -507,11 +505,17 @@ def cmd_list(args) -> None:
     home = _resolve_hermes_home()
     cfg = ForgetfulConfig.load(home)
     payload: Dict[str, Any] = {"limit": max(1, min(args.limit or 10, 50))}
-    if args.project == "current" and cfg.project_id is not None:
-        payload["project_ids"] = [cfg.project_id]
 
     client = _open_client(cfg)
     try:
+        if args.project:
+            try:
+                pid = _resolve_project_arg(client, args.project)
+            except ForgetfulClientError as exc:
+                _print(f"\n  ✗ {exc}\n")
+                client.close()
+                return
+            payload["project_ids"] = [pid]
         res = client.execute("execute_forgetful_tool", {
             "tool_name": "get_recent_memories",
             "arguments": payload,
@@ -603,16 +607,16 @@ def cmd_reset(args) -> None:
 def _dispatch(args) -> None:
     sub = getattr(args, "forgetful_command", None)
     handlers = {
-        "setup":   lambda a: cmd_setup(hermes_home=_resolve_hermes_home()),
-        "status":  cmd_status,
-        "project": cmd_project,
-        "search":  cmd_search,
-        "save":    cmd_save,
-        "list":    cmd_list,
-        "gather":  cmd_gather,
-        "explore": cmd_explore,
-        "encode":  cmd_encode,
-        "reset":   cmd_reset,
+        "setup":    lambda a: cmd_setup(hermes_home=_resolve_hermes_home()),
+        "status":   cmd_status,
+        "projects": cmd_projects,
+        "search":   cmd_search,
+        "save":     cmd_save,
+        "list":     cmd_list,
+        "gather":   cmd_gather,
+        "explore":  cmd_explore,
+        "encode":   cmd_encode,
+        "reset":    cmd_reset,
     }
     handler = handlers.get(sub)
     if handler is None:
@@ -636,18 +640,21 @@ def register_cli(subparser) -> None:
 
     subs.add_parser("status", help="Show provider health and config summary")
 
-    project = subs.add_parser("project", help="Show/list/switch project binding")
-    project.add_argument(
-        "project_command", nargs="?", choices=("show", "list", "switch"), default="show",
+    projects = subs.add_parser("projects", help="List or create Forgetful projects")
+    projects.add_argument(
+        "projects_command", nargs="?", choices=("list", "create"), default="list",
     )
-    project.add_argument("project_name", nargs="?", default=None)
+    projects.add_argument("name", nargs="?", default=None, help="Project name (for `create`)")
+    projects.add_argument(
+        "--description", default=None, help="Project description (for `create`)",
+    )
 
     search = subs.add_parser("search", help="Semantic search across memories")
     search.add_argument("query", nargs="+")
     search.add_argument("-k", type=int, default=5, help="Number of results (1-20, default 5)")
     search.add_argument(
-        "--scope", choices=("all", "current"), default="all",
-        help="all (default) searches every project; current restricts to the active project",
+        "--project", default=None,
+        help="Restrict to a single project by name or id (default: cross-project)",
     )
 
     save = subs.add_parser("save", help="Create a memory from the shell")
@@ -656,10 +663,17 @@ def register_cli(subparser) -> None:
     save.add_argument("--context")
     save.add_argument("--tags", help="Comma-separated tag list")
     save.add_argument("--importance", type=int, default=7)
+    save.add_argument(
+        "--project", default=None,
+        help="File this memory under a project (name or id). Default: global.",
+    )
 
     listp = subs.add_parser("list", help="Show recent memories")
     listp.add_argument("--limit", type=int, default=10)
-    listp.add_argument("--project", choices=("all", "current"), default="all")
+    listp.add_argument(
+        "--project", default=None,
+        help="Restrict to a single project by name or id (default: across all)",
+    )
 
     gather = subs.add_parser(
         "gather", help="Multi-source context gather (Forgetful + optional Context7)",
