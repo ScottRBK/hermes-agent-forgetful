@@ -72,11 +72,9 @@ def provider_class():
 
 
 _EXPECTED_TOOL_NAMES = {
-    "forgetful_recall",
-    "forgetful_save",
-    "forgetful_link",
-    "forgetful_obsolete",
-    "forgetful_projects",
+    "discover_forgetful_tools",
+    "how_to_use_forgetful_tool",
+    "execute_forgetful_tool",
     "forgetful_explore",
     "forgetful_gather_context",
 }
@@ -129,7 +127,10 @@ def test_handle_tool_call_returns_error_when_inactive(provider_class):
     provider = provider_class()
     # _client is None — provider is inactive.
 
-    result = provider.handle_tool_call("forgetful_save", {"content": "test"})
+    result = provider.handle_tool_call(
+        "execute_forgetful_tool",
+        {"tool_name": "create_memory", "arguments": {}},
+    )
 
     payload = json.loads(result)
     # tool_error returns a dict containing an error string mentioning the
@@ -137,3 +138,79 @@ def test_handle_tool_call_returns_error_when_inactive(provider_class):
     assert isinstance(payload, dict)
     flat = json.dumps(payload).lower()
     assert "error" in flat or "not active" in flat
+
+
+def test_execute_forgetful_tool_forwards_to_client_verbatim(provider_class, monkeypatch):
+    """``execute_forgetful_tool`` must hand its arguments straight through to
+    the MCP client without any translation, validation, or rewriting.
+
+    The plugin's job for the meta-tool surface is dispatch, not curation —
+    if forgetful adds a new tool tomorrow, the agent should reach it via
+    ``execute_forgetful_tool`` with no plugin change required.
+    """
+    provider = provider_class()
+
+    class _StubClient:
+        def is_alive(self):
+            return True
+        def close(self):
+            pass
+
+    provider._client = _StubClient()
+
+    captured: list[tuple[str, dict]] = []
+    def _fake_execute(tool_name, arguments):
+        captured.append((tool_name, dict(arguments)))
+        return {"id": 1, "ok": True}
+
+    # The plugin's _execute method is the bridge to the client.
+    monkeypatch.setattr(provider, "_execute", _fake_execute)
+
+    result = provider.handle_tool_call(
+        "execute_forgetful_tool",
+        {
+            "tool_name": "create_memory",
+            "arguments": {"title": "T", "content": "C", "context": "X", "importance": 8},
+        },
+    )
+
+    payload = json.loads(result)
+    assert payload.get("ok") is True
+
+    # Exactly one underlying call, with the inner tool name and verbatim args.
+    assert len(captured) == 1
+    inner_name, inner_args = captured[0]
+    assert inner_name == "create_memory"
+    assert inner_args == {"title": "T", "content": "C", "context": "X", "importance": 8}
+
+
+def test_discover_and_how_to_use_forward_to_client(provider_class, monkeypatch):
+    """``discover_forgetful_tools`` and ``how_to_use_forgetful_tool`` are
+    plain forwards too — the plugin doesn't synthesize their results."""
+    provider = provider_class()
+
+    class _StubClient:
+        def is_alive(self):
+            return True
+        def close(self):
+            pass
+
+    provider._client = _StubClient()
+
+    captured: list[tuple[str, dict]] = []
+    def _fake_client_execute(name, arguments=None):
+        captured.append((name, dict(arguments or {})))
+        return {"forwarded": True}
+
+    # discover/how_to_use route directly through the client (not _execute,
+    # which is the meta-dispatch wrapper for non-meta tools).
+    provider._client.execute = _fake_client_execute  # type: ignore[attr-defined]
+
+    discover_res = provider.handle_tool_call("discover_forgetful_tools", {"category": "memory"})
+    how_res = provider.handle_tool_call("how_to_use_forgetful_tool", {"tool_name": "create_memory"})
+
+    assert json.loads(discover_res).get("forwarded") is True
+    assert json.loads(how_res).get("forwarded") is True
+
+    assert ("discover_forgetful_tools", {"category": "memory"}) in captured
+    assert ("how_to_use_forgetful_tool", {"tool_name": "create_memory"}) in captured

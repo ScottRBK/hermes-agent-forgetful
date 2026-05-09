@@ -10,8 +10,9 @@ Higher-level commands (gather, explore, encode) delegate to the modules
 that own them so this file stays a thin dispatcher.
 
 Project model: there is no "current project" sticky state. The agent or
-CLI user chooses a project per save; ``forgetful_projects`` (or
-``hermes forgetful projects``) lists / creates them.
+CLI user chooses a project per save. The agent uses ``execute_forgetful_tool``
+with ``tool_name="list_projects"`` / ``"create_project"``; CLI users use
+``hermes forgetful projects`` to list / create them.
 """
 
 from __future__ import annotations
@@ -253,8 +254,7 @@ def _ensure_project(
 def _resolve_project_arg(client: ForgetfulClient, value: str) -> int:
     """Resolve a CLI project arg (name or numeric string) to an id.
 
-    Mirrors the in-process resolver in ``__init__.py:_resolve_project``,
-    but uses the short-lived CLI client. Raises ``ForgetfulClientError``
+    Uses the short-lived CLI client. Raises ``ForgetfulClientError``
     when the name doesn't match any existing project.
     """
     text = value.strip()

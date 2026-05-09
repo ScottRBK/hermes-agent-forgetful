@@ -2,8 +2,13 @@
 
 Wraps a long-lived ``uvx forgetful-ai`` stdio subprocess and adapts it
 to hermes-agent's ``MemoryProvider`` contract. Supports three recall
-modes (``hybrid`` / ``context`` / ``tools``) and exposes six agent-callable
-tools when tools are enabled.
+modes (``hybrid`` / ``context`` / ``tools``) and exposes five agent-callable
+tools when tools are enabled: Forgetful's three meta-tools
+(``discover_forgetful_tools``, ``how_to_use_forgetful_tool``,
+``execute_forgetful_tool``) plus two plugin-side compositions
+(``forgetful_explore``, ``forgetful_gather_context``) that orchestrate
+multi-step graph traversal and cross-source context assembly that the
+meta surface alone can't express.
 
 Provider-agnostic: schemas use OpenAI function-calling shape so every
 hermes provider adapter (Anthropic, OpenAI, Bedrock, Gemini, …) can
@@ -14,6 +19,7 @@ Reference:
 - Gold-standard plugin: ``~/dev/hermes-agent/plugins/memory/honcho/__init__.py``
 - Backend transport: ``./client.py``
 - Resolved config: ``./config.py``
+- Forgetful meta-tools source: ``~/dev/forgetful/app/routes/mcp/meta_tools.py``
 """
 
 from __future__ import annotations
@@ -88,193 +94,184 @@ def _is_trivial_prompt(query: str) -> bool:
 
 ENCODING_AGENT_TAG = "hermes-agent/forgetful-plugin"
 
-RECALL_SCHEMA = {
-    "name": "forgetful_recall",
-    "description": (
-        "Semantic search over the Forgetful knowledge base. Returns memories "
-        "ranked by relevance with optional linked-memory context. Cross-project "
-        "by default — pass project_ids to restrict the search."
-    ),
-    "parameters": {
-        "type": "object",
-        "properties": {
-            "query": {
-                "type": "string",
-                "description": "Natural language search query.",
-            },
-            "query_context": {
-                "type": "string",
-                "description": "Brief explanation of WHY you're searching — improves reranking.",
-            },
-            "k": {
-                "type": "integer",
-                "description": "Number of primary results to return (1-20, default 5).",
-            },
-            "project_ids": {
-                "type": "array",
-                "items": {"type": "integer"},
-                "description": (
-                    "Optional list of project ids to restrict the search to. "
-                    "When omitted (default), recall is cross-project — search "
-                    "every project the user has."
-                ),
-            },
-            "include_links": {
-                "type": "boolean",
-                "description": "When true, attach linked memories to each result for additional context (default true).",
-            },
-            "importance_min": {
-                "type": "integer",
-                "description": "Minimum importance score (1-10) for results.",
-            },
-        },
-        "required": ["query"],
-    },
-}
+# ---------------------------------------------------------------------------
+# Forgetful meta-tool schemas (transcribed from forgetful-ai's MCP surface)
+#
+# These three tools mirror the meta-pattern Forgetful itself exposes —
+# rather than us authoring curated wrappers around create_memory /
+# query_memory / etc., the agent reaches every Forgetful capability via:
+#
+#     1. ``discover_forgetful_tools``    — list the live catalog
+#     2. ``how_to_use_forgetful_tool``   — fetch detailed parameter docs
+#     3. ``execute_forgetful_tool``      — invoke any underlying tool
+#
+# The descriptions below are static copies of the docstrings shipped by
+# ``~/dev/forgetful/app/routes/mcp/meta_tools.py`` (with feature-flagged
+# sections inlined so the agent always sees the full surface). Hermes
+# requires schemas at ``add_provider`` time, before the MCP subprocess
+# starts — see ``tests/test_tool_schemas.py`` for the regression that
+# pins this contract — so dynamic ``list_tools()`` fetch is not viable.
+# ---------------------------------------------------------------------------
 
-SAVE_SCHEMA = {
-    "name": "forgetful_save",
+DISCOVER_TOOLS_SCHEMA = {
+    "name": "discover_forgetful_tools",
     "description": (
-        "Persist a single atomic memory in Forgetful. Use for non-obvious "
-        "decisions, durable patterns, surprising learnings, or facts worth "
-        "recalling in future sessions. One concept per memory — keep it tight. "
-        "Pass `project` (name or id) to file the memory in a specific project; "
-        "omit it to save global (visible from every project's recall). Use "
-        "forgetful_projects first if you need to list or create a project."
+        "Discover the live catalog of Forgetful tools available via "
+        "execute_forgetful_tool. Returns each tool's name, mutation flag, "
+        "parameters and an example call — enough to call the tool one-shot "
+        "without a follow-up how_to_use lookup. Use this when you need to "
+        "do something with memory and aren't sure which underlying tool fits, "
+        "or to see what's available beyond the most common operations.\n\n"
+        "## Tool catalog (representative — call discover for the live list)\n\n"
+        "**User Tools** — User profile and preferences\n"
+        "- get_current_user, update_user_notes\n\n"
+        "**Memory Tools** — Atomic knowledge storage (<400 words per memory)\n"
+        "- create_memory: Store a single concept with auto-linking; supports provenance fields "
+        "(source_repo, source_files, source_url, confidence, encoding_agent, encoding_version)\n"
+        "- query_memory: Semantic search (use query_context for better ranking)\n"
+        "- get_memory, update_memory, get_recent_memories\n"
+        "- link_memories, unlink_memories\n"
+        "- mark_memory_obsolete: Soft-delete with audit trail and optional superseded_by\n\n"
+        "**Project Tools** — Organise memories by context/scope\n"
+        "- create_project, get_project, list_projects, update_project, delete_project\n\n"
+        "**Code Artifact Tools** — Reusable code snippets\n"
+        "- create_code_artifact, get_code_artifact, list_code_artifacts, update_code_artifact, delete_code_artifact\n\n"
+        "**Document Tools** — Long-form content (>300 words)\n"
+        "- create_document, get_document, list_documents, update_document, delete_document\n\n"
+        "**Entity Tools** — Real-world entities (people, orgs, devices)\n"
+        "- create_entity, get_entity, list_entities, search_entities, update_entity, delete_entity\n"
+        "- link_entity_to_memory, unlink_entity_from_memory\n"
+        "- link_entity_to_project, unlink_entity_from_project, get_entity_memories\n"
+        "- create_entity_relationship, get_entity_relationships, update_entity_relationship, delete_entity_relationship\n\n"
+        "Some servers also expose Skill / File / Plan / Task categories — "
+        "call discover_forgetful_tools() with no category to see the live set.\n\n"
+        "## Workflow\n"
+        "1. discover_forgetful_tools() → see the catalog (optionally filtered by category)\n"
+        "2. how_to_use_forgetful_tool(tool_name) → full parameter docs for one tool\n"
+        "3. execute_forgetful_tool(tool_name, arguments) → run it"
     ),
     "parameters": {
         "type": "object",
         "properties": {
-            "title": {
+            "category": {
                 "type": "string",
-                "description": "Short scannable title (5-200 chars).",
-            },
-            "content": {
-                "type": "string",
-                "description": "Memory body (max 2000 chars, ~300-400 words). One concept.",
-            },
-            "context": {
-                "type": "string",
-                "description": "WHY this matters / HOW it relates / WHAT implications (max 500 chars).",
-            },
-            "keywords": {
-                "type": "array",
-                "items": {"type": "string"},
-                "description": "Search keywords for semantic matching (max 10).",
-            },
-            "tags": {
-                "type": "array",
-                "items": {"type": "string"},
-                "description": "Categorization tags (max 10).",
-            },
-            "importance": {
-                "type": "integer",
-                "description": "Importance score (1-10, default 7). 9-10=foundational, 7-8=useful pattern.",
-            },
-            "project": {
-                "type": ["string", "integer"],
                 "description": (
-                    "Optional. Project name (string) or id (integer) to file "
-                    "this memory under. Omit to save global (no project tag). "
-                    "Names are resolved via list_projects — unknown names "
-                    "return an error so the agent can call forgetful_projects "
-                    "to create the project explicitly."
+                    "Optional category filter. Common categories: user, memory, "
+                    "project, code_artifact, document, entity, linking. Some "
+                    "servers expose more (skill, file, plan, task) depending on "
+                    "feature flags — call with no category to see the live list."
                 ),
             },
         },
-        "required": ["title", "content", "context"],
     },
 }
 
-PROJECTS_SCHEMA = {
-    "name": "forgetful_projects",
+HOW_TO_USE_SCHEMA = {
+    "name": "how_to_use_forgetful_tool",
     "description": (
-        "List or create Forgetful projects. Default: returns the current "
-        "project list (id, name, description). Pass `create` with a "
-        "{name, description} object to create a new project — call this "
-        "before forgetful_save when filing a memory under a project that "
-        "doesn't exist yet. Memories are organised by project; the agent "
-        "decides per-save which project (if any) a memory belongs in."
+        "Get detailed documentation for a specific Forgetful tool, including "
+        "its JSON parameter schema, required vs optional fields, return shape, "
+        "and examples. Call this when you've identified a tool via discover "
+        "but need the exact arguments to pass to execute_forgetful_tool."
     ),
     "parameters": {
         "type": "object",
         "properties": {
-            "create": {
+            "tool_name": {
+                "type": "string",
+                "description": (
+                    "Name of the underlying Forgetful tool to look up "
+                    "(e.g. 'create_memory', 'query_memory', 'create_project')."
+                ),
+            },
+        },
+        "required": ["tool_name"],
+    },
+}
+
+EXECUTE_TOOL_SCHEMA = {
+    "name": "execute_forgetful_tool",
+    "description": (
+        "Execute any registered Forgetful tool by name. Forgetful is a "
+        "semantic memory system — use this to read, write, link, and curate "
+        "memories, projects, documents, code artifacts, and entities.\n\n"
+        "## Quick Start — One-Shot Examples\n\n"
+        "**Memory operations:**\n"
+        "- Search: execute_forgetful_tool(\"query_memory\", "
+        "{\"query\": \"search terms\", \"query_context\": \"why searching\"})\n"
+        "- Create: execute_forgetful_tool(\"create_memory\", "
+        "{\"title\": \"Short title\", \"content\": \"Memory body (<2000 chars)\", "
+        "\"context\": \"Why this matters\", \"keywords\": [\"kw1\"], "
+        "\"tags\": [\"tag1\"], \"importance\": 7, \"project_ids\": [1]})\n"
+        "- Create with provenance: add source_repo, source_files, "
+        "confidence, encoding_agent fields to track origin\n"
+        "- Update: execute_forgetful_tool(\"update_memory\", "
+        "{\"memory_id\": 1, \"content\": \"new content\"})\n"
+        "- Get: execute_forgetful_tool(\"get_memory\", {\"memory_id\": 1})\n"
+        "- Link: execute_forgetful_tool(\"link_memories\", "
+        "{\"memory_id\": 1, \"related_ids\": [2, 3]})\n"
+        "- Obsolete: execute_forgetful_tool(\"mark_memory_obsolete\", "
+        "{\"memory_id\": 42, \"reason\": \"outdated\", \"superseded_by\": 100})\n\n"
+        "**Project organisation:**\n"
+        "- List: execute_forgetful_tool(\"list_projects\", {})\n"
+        "- Create: execute_forgetful_tool(\"create_project\", "
+        "{\"name\": \"Project Name\", \"description\": \"What this is\", "
+        "\"project_type\": \"development\"})\n"
+        "- Query within project: pass \"project_ids\": [1] to query_memory\n\n"
+        "**Entities (people, orgs, devices):**\n"
+        "- Create: execute_forgetful_tool(\"create_entity\", "
+        "{\"name\": \"Sarah Chen\", \"entity_type\": \"Individual\", "
+        "\"notes\": \"Backend dev\", \"aka\": [\"Sarah\", \"S.C.\"]})\n"
+        "- Search: execute_forgetful_tool(\"search_entities\", "
+        "{\"query\": \"Sarah\"})  # searches name AND aka\n"
+        "- Link to memory: execute_forgetful_tool(\"link_entity_to_memory\", "
+        "{\"entity_id\": 1, \"memory_id\": 1})\n\n"
+        "**Documents (long-form, >300 words):**\n"
+        "- Create: execute_forgetful_tool(\"create_document\", "
+        "{\"title\": \"Doc Title\", \"description\": \"Brief summary\", "
+        "\"content\": \"Long content...\", \"document_type\": \"text\", "
+        "\"project_id\": 1})\n\n"
+        "**Code artifacts (reusable snippets):**\n"
+        "- Create: execute_forgetful_tool(\"create_code_artifact\", "
+        "{\"title\": \"Snippet\", \"description\": \"What it does\", "
+        "\"code\": \"def f(): pass\", \"language\": \"python\", \"project_id\": 1})\n\n"
+        "## Linking Best Practices — always link related items for discoverability\n"
+        "- When creating documents, link atomic memories: pass document_ids on create_memory\n"
+        "- When creating code artifacts, link to memories: pass code_artifact_ids on create_memory\n"
+        "- Memory-to-memory: link_memories(memory_id, related_ids=[...])\n"
+        "- Entity-to-memory: link_entity_to_memory(entity_id, memory_id)\n"
+        "- Entity-to-project: link_entity_to_project(entity_id, project_id)\n\n"
+        "Use discover_forgetful_tools(category?) for the live catalog and "
+        "how_to_use_forgetful_tool(tool_name) for the complete parameter "
+        "schema of any specific tool."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "tool_name": {
+                "type": "string",
+                "description": (
+                    "Name of the Forgetful tool to execute (e.g. 'create_memory', "
+                    "'query_memory'). See discover_forgetful_tools for the live catalog."
+                ),
+            },
+            "arguments": {
                 "type": "object",
-                "description": "When provided, creates a new project instead of listing.",
-                "properties": {
-                    "name": {
-                        "type": "string",
-                        "description": "Project name (used as the resolution key for forgetful_save's `project` field).",
-                    },
-                    "description": {
-                        "type": "string",
-                        "description": "What this project covers — shown in listings and used for disambiguation.",
-                    },
-                },
-                "required": ["name", "description"],
+                "description": (
+                    "Tool-specific arguments. Call how_to_use_forgetful_tool(tool_name) "
+                    "for the complete parameter schema of a given tool."
+                ),
             },
         },
-    },
-}
-
-LINK_SCHEMA = {
-    "name": "forgetful_link",
-    "description": (
-        "Manually link a memory to one or more related memories. Builds the "
-        "knowledge graph beyond automatic embedding-similarity links."
-    ),
-    "parameters": {
-        "type": "object",
-        "properties": {
-            "memory_id": {
-                "type": "integer",
-                "description": "Source memory ID.",
-            },
-            "related_ids": {
-                "type": "array",
-                "items": {"type": "integer"},
-                "description": "Target memory IDs to link to the source.",
-            },
-        },
-        "required": ["memory_id", "related_ids"],
-    },
-}
-
-OBSOLETE_SCHEMA = {
-    "name": "forgetful_obsolete",
-    "description": (
-        "Mark a memory as obsolete with an audit trail. Soft delete — "
-        "the memory is preserved but excluded from default queries. "
-        "Optionally point to a replacement via superseded_by."
-    ),
-    "parameters": {
-        "type": "object",
-        "properties": {
-            "memory_id": {
-                "type": "integer",
-                "description": "Memory ID to mark obsolete.",
-            },
-            "reason": {
-                "type": "string",
-                "description": "Why this memory is obsolete (audit trail).",
-            },
-            "superseded_by": {
-                "type": "integer",
-                "description": "Optional ID of the replacement memory.",
-            },
-        },
-        "required": ["memory_id", "reason"],
+        "required": ["tool_name", "arguments"],
     },
 }
 
 
-_BASIC_TOOL_SCHEMAS = [
-    RECALL_SCHEMA,
-    SAVE_SCHEMA,
-    LINK_SCHEMA,
-    OBSOLETE_SCHEMA,
-    PROJECTS_SCHEMA,
+_META_TOOL_SCHEMAS = [
+    DISCOVER_TOOLS_SCHEMA,
+    HOW_TO_USE_SCHEMA,
+    EXECUTE_TOOL_SCHEMA,
 ]
 
 
@@ -502,38 +499,6 @@ class ForgetfulMemoryProvider(MemoryProvider):
     def _is_inactive(self) -> bool:
         return self._cron_skipped or self._client is None or not self._client.is_alive()
 
-    def _resolve_project(self, value: Any) -> int:
-        """Resolve ``value`` (project name or id) to a project id.
-
-        - ``int``: returned as-is.
-        - ``str`` of digits: parsed as id.
-        - ``str``: looked up by name via ``list_projects``. Raises
-          ``ValueError`` when no project matches — the caller is expected
-          to surface this as a ``tool_error`` so the agent can decide
-          whether to create the project explicitly.
-        """
-        if isinstance(value, bool):
-            raise ValueError(f"project must be a name or id, got bool")
-        if isinstance(value, int):
-            return value
-        if isinstance(value, str):
-            text = value.strip()
-            if not text:
-                raise ValueError("project name is empty")
-            if text.isdigit():
-                return int(text)
-            listing = self._execute("list_projects", {})
-            for p in (listing.get("projects") or []):
-                if isinstance(p, dict) and p.get("name") == text:
-                    return int(p["id"])
-            raise ValueError(
-                f"unknown project name {text!r} — call forgetful_projects to "
-                "list current projects or create=... to add a new one"
-            )
-        raise ValueError(
-            f"project must be a name (string) or id (integer), got {type(value).__name__}"
-        )
-
     def _execute(self, tool_name: str, args: Dict[str, Any]) -> Dict[str, Any]:
         """Call a forgetful MCP tool via the meta-tool dispatcher."""
         if self._client is None:
@@ -549,7 +514,8 @@ class ForgetfulMemoryProvider(MemoryProvider):
         """Return tool schemas based on recall mode.
 
         ``context`` mode hides all tools (auto-injected context only).
-        ``tools`` and ``hybrid`` modes both expose the full surface.
+        ``tools`` and ``hybrid`` modes both expose the full surface: the
+        three Forgetful meta-tools plus two plugin-side compositions.
 
         Liveness is *deliberately* not checked here. Hermes-agent calls
         this from ``MemoryManager.add_provider`` to populate the dispatch
@@ -561,10 +527,18 @@ class ForgetfulMemoryProvider(MemoryProvider):
         """
         if self._recall_mode == "context":
             return []
-        return list(_BASIC_TOOL_SCHEMAS) + [EXPLORE_SCHEMA, GATHER_SCHEMA]
+        return list(_META_TOOL_SCHEMAS) + [EXPLORE_SCHEMA, GATHER_SCHEMA]
 
     def handle_tool_call(self, tool_name: str, args: Dict[str, Any], **kwargs) -> str:
         """Dispatch a tool call to the matching handler.
+
+        Meta-tool dispatch (``discover_forgetful_tools``,
+        ``how_to_use_forgetful_tool``, ``execute_forgetful_tool``) is a
+        verbatim forward to the MCP subprocess — the plugin adds no
+        translation, validation, or argument rewriting on top. The two
+        composition tools (``forgetful_explore``, ``forgetful_gather_context``)
+        keep their dedicated handlers because they orchestrate multi-step
+        workflows that the meta surface alone can't express.
 
         Always returns a JSON string (success payload or ``tool_error``).
         """
@@ -572,16 +546,24 @@ class ForgetfulMemoryProvider(MemoryProvider):
             return tool_error("forgetful: provider not active")
 
         try:
-            if tool_name == "forgetful_recall":
-                return self._handle_recall(args)
-            if tool_name == "forgetful_save":
-                return self._handle_save(args)
-            if tool_name == "forgetful_link":
-                return self._handle_link(args)
-            if tool_name == "forgetful_obsolete":
-                return self._handle_obsolete(args)
-            if tool_name == "forgetful_projects":
-                return self._handle_projects(args)
+            if tool_name in ("discover_forgetful_tools", "how_to_use_forgetful_tool"):
+                # Forgetful exposes these as direct MCP tools — no need to
+                # wrap them under execute_forgetful_tool.
+                result = self._client.execute(tool_name, args or {})
+                return json.dumps(result, default=str)
+            if tool_name == "execute_forgetful_tool":
+                inner_name = args.get("tool_name")
+                inner_args = args.get("arguments") or {}
+                if not isinstance(inner_name, str) or not inner_name:
+                    return tool_error(
+                        "execute_forgetful_tool: 'tool_name' (string) is required"
+                    )
+                if not isinstance(inner_args, dict):
+                    return tool_error(
+                        "execute_forgetful_tool: 'arguments' must be an object"
+                    )
+                result = self._execute(inner_name, inner_args)
+                return json.dumps(result, default=str)
             if tool_name == "forgetful_gather_context":
                 return self._handle_gather_context(args)
             if tool_name == "forgetful_explore":
@@ -594,118 +576,6 @@ class ForgetfulMemoryProvider(MemoryProvider):
             logger.exception("forgetful: %s raised", tool_name)
             return tool_error(f"forgetful {tool_name}: {exc}")
 
-    # -- per-tool handlers -------------------------------------------------
-
-    def _handle_recall(self, args: Dict[str, Any]) -> str:
-        query = (args.get("query") or "").strip()
-        if not query:
-            return tool_error("forgetful_recall: 'query' is required")
-
-        payload: Dict[str, Any] = {
-            "query": query,
-            "query_context": args.get("query_context") or "agent recall",
-            "k": _clamp_int(args.get("k"), default=5, lo=1, hi=20),
-            "include_links": bool(args.get("include_links", True)),
-        }
-        if (importance := args.get("importance_min")) is not None:
-            payload["importance_threshold"] = _clamp_int(importance, default=1, lo=1, hi=10)
-
-        raw_pids = args.get("project_ids")
-        if isinstance(raw_pids, list) and raw_pids:
-            coerced = [pid for pid in (_coerce_int(v) for v in raw_pids) if pid is not None]
-            if coerced:
-                payload["project_ids"] = coerced
-                payload["strict_project_filter"] = True
-
-        result = self._execute("query_memory", payload)
-        return json.dumps(result, default=str)
-
-    def _handle_save(self, args: Dict[str, Any]) -> str:
-        title = (args.get("title") or "").strip()
-        content = (args.get("content") or "").strip()
-        context = (args.get("context") or "").strip()
-        missing = [
-            n for n, v in (("title", title), ("content", content), ("context", context))
-            if not v
-        ]
-        if missing:
-            return tool_error(
-                f"forgetful_save: missing required field(s): {', '.join(missing)}"
-            )
-
-        if len(content) > 2000:
-            return tool_error(
-                f"forgetful_save: content exceeds 2000 char limit (got {len(content)})"
-            )
-
-        keywords = _coerce_str_list(args.get("keywords"), max_len=10)
-        tags = _coerce_str_list(args.get("tags"), max_len=10)
-
-        payload: Dict[str, Any] = {
-            "title": title[:200],
-            "content": content,
-            "context": context[:500],
-            "keywords": keywords,
-            "tags": tags,
-            "importance": _clamp_int(args.get("importance"), default=7, lo=1, hi=10),
-            "encoding_agent": ENCODING_AGENT_TAG,
-        }
-
-        project = args.get("project")
-        if project is not None:
-            try:
-                payload["project_ids"] = [self._resolve_project(project)]
-            except ValueError as exc:
-                return tool_error(f"forgetful_save: {exc}")
-
-        result = self._execute("create_memory", payload)
-        return json.dumps(result, default=str)
-
-    def _handle_projects(self, args: Dict[str, Any]) -> str:
-        """List existing projects, or create one when ``create`` is provided.
-
-        Default (no args) returns the project list. Pass ``create``: a
-        ``{name, description}`` object to create a new project — the
-        plugin invalidates its prompt-block cache on success so the new
-        project shows up next turn.
-        """
-        create = args.get("create")
-        if isinstance(create, dict):
-            name = (create.get("name") or "").strip()
-            description = (create.get("description") or "").strip()
-            if not name:
-                return tool_error("forgetful_projects: create.name is required")
-            if not description:
-                return tool_error("forgetful_projects: create.description is required")
-            result = self._execute(
-                "create_project",
-                {"name": name, "description": description, "project_type": "development"},
-            )
-            self._refresh_projects_cache()
-            return json.dumps(result, default=str)
-
-        result = self._execute("list_projects", {})
-        return json.dumps(result, default=str)
-
-    def _handle_link(self, args: Dict[str, Any]) -> str:
-        memory_id = _coerce_int(args.get("memory_id"))
-        related = args.get("related_ids") or []
-        if memory_id is None:
-            return tool_error("forgetful_link: 'memory_id' must be an integer")
-        if not isinstance(related, list) or not related:
-            return tool_error("forgetful_link: 'related_ids' must be a non-empty list")
-        related_ints: List[int] = []
-        for value in related:
-            coerced = _coerce_int(value)
-            if coerced is None:
-                return tool_error(f"forgetful_link: related id {value!r} is not an integer")
-            related_ints.append(coerced)
-        result = self._execute(
-            "link_memories",
-            {"memory_id": memory_id, "related_ids": related_ints},
-        )
-        return json.dumps(result, default=str)
-
     # -- system prompt block ----------------------------------------------
 
     def system_prompt_block(self) -> str:
@@ -713,9 +583,9 @@ class ForgetfulMemoryProvider(MemoryProvider):
 
         Empty under cron/inactive. Cache-friendly: contains no per-turn
         context (live recall is injected via ``prefetch()``). Lists the
-        available projects so the agent can pick one when calling
-        ``forgetful_save`` — projects are not sticky; every save is an
-        explicit per-call decision.
+        available projects so the agent can pick one when filing a memory —
+        projects are not sticky; every save is an explicit per-call
+        decision passed via ``execute_forgetful_tool``'s arguments.
         """
         if self._is_inactive():
             return ""
@@ -764,8 +634,10 @@ class ForgetfulMemoryProvider(MemoryProvider):
         if not self._projects_cache:
             return (
                 "## Forgetful projects\n"
-                "_No projects yet. Call `forgetful_projects` with `create={\"name\":..., "
-                "\"description\":...}` to add one before saving project-scoped memories."
+                "_No projects yet. Call `execute_forgetful_tool` with "
+                "`tool_name=\"create_project\"` and `arguments={\"name\": ..., "
+                "\"description\": ..., \"project_type\": \"development\"}` "
+                "to add one before saving project-scoped memories."
             )
         lines = ["## Forgetful projects"]
         for p in self._projects_cache:
@@ -776,8 +648,10 @@ class ForgetfulMemoryProvider(MemoryProvider):
             marker = " ← matches current directory" if pid == self._cwd_project_id else ""
             lines.append(f"- **{name}** (id={pid}){marker}")
         lines.append(
-            "Saves default to global (no project). Pass `project: <name|id>` to "
-            "`forgetful_save` to file under one of the above."
+            "Saves default to global (no project). To file a memory under "
+            "one of the above, call `execute_forgetful_tool` with "
+            "`tool_name=\"create_memory\"` and pass `project_ids: [<id>]` "
+            "in `arguments`."
         )
         return "\n".join(lines)
 
@@ -786,8 +660,9 @@ class ForgetfulMemoryProvider(MemoryProvider):
 
         Errors are swallowed at debug level — the cache stays empty and
         the prompt simply tells the agent there are no projects yet.
-        Called once at initialize and again whenever the agent creates a
-        project via ``forgetful_projects``.
+        Called once at initialize. The cache will go stale if the agent
+        creates a new project via ``execute_forgetful_tool`` mid-session;
+        addressing that drift is deferred to a follow-up pass.
         """
         if self._client is None:
             return
@@ -1003,7 +878,8 @@ class ForgetfulMemoryProvider(MemoryProvider):
         context = (
             f"Auto-captured turn from hermes session {sid or 'unknown'}. "
             "Low-importance backup of conversation context — promote to a "
-            "higher-importance memory via forgetful_save when worth keeping."
+            "higher-importance memory via execute_forgetful_tool with "
+            "tool_name=create_memory when worth keeping."
         )[:500]
 
         payload: Dict[str, Any] = {
@@ -1032,19 +908,6 @@ class ForgetfulMemoryProvider(MemoryProvider):
             target=_sync, daemon=True, name="forgetful-sync",
         )
         self._sync_thread.start()
-
-    def _handle_obsolete(self, args: Dict[str, Any]) -> str:
-        memory_id = _coerce_int(args.get("memory_id"))
-        reason = (args.get("reason") or "").strip()
-        if memory_id is None:
-            return tool_error("forgetful_obsolete: 'memory_id' must be an integer")
-        if not reason:
-            return tool_error("forgetful_obsolete: 'reason' is required")
-        payload: Dict[str, Any] = {"memory_id": memory_id, "reason": reason}
-        if (sup := _coerce_int(args.get("superseded_by"))) is not None:
-            payload["superseded_by"] = sup
-        result = self._execute("mark_memory_obsolete", payload)
-        return json.dumps(result, default=str)
 
 
 # ---------------------------------------------------------------------------
