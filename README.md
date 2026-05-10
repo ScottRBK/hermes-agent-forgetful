@@ -10,15 +10,15 @@ A [hermes-agent](https://github.com/NousResearch/hermes-agent) memory provider p
 
 ## What it gives you
 
-- **Cross-session memory** — every hermes turn is auto-captured at low importance; agentic `forgetful_save` calls for the things worth keeping.
-- **Six tools the agent can call directly** —
-  - `forgetful_recall` (semantic search, cross-project by default)
-  - `forgetful_save` (create an atomic memory)
-  - `forgetful_link` / `forgetful_obsolete` (curate the graph)
-  - `forgetful_explore` (5-phase deep graph traversal)
-  - `forgetful_gather_context` (Forgetful + optional Context7 — six-section markdown report)
+- **Cross-session memory** — every hermes turn is auto-captured at low importance; agent-driven `execute_forgetful_tool` calls (`create_memory`, `link_memories`, …) for the things worth keeping.
+- **Five tools the agent can call directly** — split into a meta-tier (verbatim forwards to Forgetful's full surface) and a composition tier (multi-phase orchestrations the meta surface can't express in one call):
+  - `discover_forgetful_tools` — list available Forgetful tools by category.
+  - `how_to_use_forgetful_tool` — fetch the docstring for any one tool.
+  - `execute_forgetful_tool` — call any Forgetful tool by name with arbitrary arguments. New backend tools land for free; the plugin needs no change.
+  - `forgetful_explore` — 5-phase deep graph traversal.
+  - `forgetful_gather_context` — Forgetful + optional Context7, six-section markdown report.
 - **Three recall modes** — `hybrid` (default: auto-injected context AND tools), `context` (auto-inject only), `tools` (CRUD only).
-- **A standalone CLI** at `hermes forgetful {setup,status,project,search,save,list,gather,explore,encode,reset}`.
+- **A standalone CLI** at `hermes forgetful {setup,status,projects,search,save,list,gather,explore,encode,reset}`.
 - **A multi-phase repo encoder** that bootstraps a freshly-cloned project into the knowledge base.
 
 ## Install
@@ -52,8 +52,8 @@ hermes memory setup
 The wizard:
 1. Verifies `uvx` is available.
 2. Asks for a recall mode (default `hybrid`).
-3. Detects the git remote of the current directory and proposes a project name.
-4. Spins up the Forgetful subprocess, creates the project, and binds your `~/.hermes/forgetful.json` to it.
+3. Detects the git remote of the current directory and offers to create a matching Forgetful project (so the cwd-hint in the system prompt has something to point at).
+4. Writes `~/.hermes/forgetful.json` (subprocess command, recall mode, backend choice — **no `project_id` / `project_name`**; project is decided per save).
 5. Sets `memory.provider: forgetful` in your `~/.hermes/config.yaml`.
 
 You're done — the next `hermes` invocation has memory.
@@ -64,17 +64,19 @@ You're done — the next `hermes` invocation has memory.
 hermes forgetful status
 ```
 
-Should print HERMES_HOME, the active project, the recall mode, and a successful "Connected — N backend tools available" probe.
+Should print HERMES_HOME, the recall mode, the backend, and a successful "Connected — N backend tools available" probe along with a count of available projects.
 
 ## Daily use
 
 ### Inside a hermes session (hybrid / tools mode)
 
-The agent sees the six tools and decides when to call them. Typical flow:
+The agent sees the five tools and decides when to call them. Typical flow:
 
 - You ask a question; before answering, the model auto-recalls relevant prior memories (injected as `<memory-context>`).
-- The model can call `forgetful_save` mid-conversation to persist a non-obvious decision.
+- The system prompt also lists the available projects (with a hint marking the cwd-matched one) so the model knows where to file new memories.
+- The model calls `execute_forgetful_tool` with `tool_name="create_memory"` mid-conversation to persist a non-obvious decision (passing `project_ids: [<id>]` if it should be project-scoped).
 - For complex planning, the model calls `forgetful_gather_context` and gets a six-section report (Memories / Code Patterns / Framework Guidance / Architectural Decisions / Knowledge Graph Insights / Implementation Notes).
+- If it ever needs a tool it doesn't recognise, it calls `discover_forgetful_tools` / `how_to_use_forgetful_tool` to introspect the backend.
 
 ### From the shell
 
@@ -87,7 +89,7 @@ hermes forgetful save --title "Pin Pydantic to 2.x" \
     --content "Pydantic 3 broke our Field validators." \
     --context "Upgrade attempted 2026-04, reverted."
 
-# List recent memories in the active project
+# List recent memories in the project matching the current directory's git remote
 hermes forgetful list --project current --limit 20
 
 # 5-phase graph traversal of a topic
@@ -103,18 +105,23 @@ Set in `~/.hermes/forgetful.json` or via `FORGETFUL_RECALL_MODE`:
 
 | Mode | Auto-injected context | Tools exposed | When to use |
 |---|---|---|---|
-| `hybrid` *(default)* | yes | yes (all 6) | General use — model gets context AND can curate. |
+| `hybrid` *(default)* | yes | yes (all 5) | General use — model gets context AND can curate. |
 | `context` | yes | no | When you want passive recall but a clean tool surface (e.g. agentic loops where extra tools confuse the model). |
-| `tools` | no | yes (all 6) | When you want explicit-recall-only and prefer no auto-injection. |
+| `tools` | no | yes (all 5) | When you want explicit-recall-only and prefer no auto-injection. |
 
 ## Project scoping
 
-**Writes** are tagged with the active project automatically. **Reads are cross-project by default** — this is the killer feature: when you're solving something in project A, you'll surface the time you solved it in project B. Tools accept `scope='current'` to opt back into project-scoped reads.
+There is **no "active project" sticky state** — every save is an explicit per-call decision. The plugin's job is to keep the agent informed; the agent's job is to file memories in the right place.
 
-To switch projects:
+- The system prompt block lists every Forgetful project with its id and name, and marks the one whose remote matches the current directory.
+- To file a memory under a project, the agent passes `project_ids: [<id>]` in the `create_memory` arguments. To save globally, it omits the field.
+- **Reads are cross-project by default** — this is the killer feature: when you're solving something in project A, you'll surface the time you solved it in project B. To narrow a query, the agent passes `project_ids: [<id>]` to `query_memory`.
+
+To list / create projects from the shell:
 
 ```bash
-hermes forgetful project switch <project-name>
+hermes forgetful projects list
+hermes forgetful projects create <name>
 ```
 
 ## Optional: Context7 companion
@@ -171,8 +178,6 @@ All config flows through `~/.hermes/forgetful.json` (non-secret) and environment
 |---|---|---|---|
 | Recall mode | `recall_mode` | `FORGETFUL_RECALL_MODE` | `hybrid` |
 | Context token cap | `context_tokens` | `FORGETFUL_CONTEXT_TOKENS` | `4000` |
-| Active project id | `project_id` | `FORGETFUL_PROJECT_ID` | _(unset)_ |
-| Active project name | `project_name` | `FORGETFUL_PROJECT_NAME` | _(unset)_ |
 | Subprocess command | `forgetful_command` | `FORGETFUL_COMMAND` | `uvx` |
 | Subprocess args | `forgetful_args` | `FORGETFUL_ARGS` | `forgetful-ai` |
 | Startup timeout (s) | `startup_timeout` | `FORGETFUL_STARTUP_TIMEOUT` | `60` |
@@ -196,7 +201,7 @@ All config flows through `~/.hermes/forgetful.json` (non-secret) and environment
 
 **Memory writes silently dropped** — confirm you're not in a cron/flush execution context (`hermes` invoked via `hermes cron run` or similar). The plugin intentionally skips writes from those contexts to avoid corrupting your KB with system-prompt-driven turns.
 
-**Cross-project recall pulled in something irrelevant** — pass `scope='current'` (in the tool args, or `--scope current` in the CLI) to constrain to the active project.
+**Cross-project recall pulled in something irrelevant** — narrow the query by passing `project_ids: [<id>]` to `query_memory` (the agent does this via `execute_forgetful_tool`; the CLI does it via `--project current` on `search` / `list`).
 
 **Subprocess hangs after agent exit** — the plugin registers an `atexit` handler that kills the subprocess on hermes shutdown. If something escapes, `pkill -f 'forgetful-ai'`.
 
