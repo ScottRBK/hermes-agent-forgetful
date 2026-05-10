@@ -61,12 +61,14 @@ If your profile is unknown, default to **medium**. Stay within the band — don'
 
 **Note:** The `forgetful_save` 2000 char limit means each memory must be concise. For large projects, this naturally encourages more focused memories rather than fewer comprehensive ones.
 
-**Large repo reality check:** Hitting 60+ memories for large repos requires granularity. Don't just create one memory per major subsystem — split into sub-modules. Example from hermes-agent encoding (2679 files, 30 memories produced vs 66-112 target):
-- Architecture: instead of one "AIAgent" memory, split into "AIAgent: Core Loop", "AIAgent: Context Management", "AIAgent: Tool Execution"
-- Patterns: mine for 5-8 patterns, not just 3-4 (decorators, error shapes, config patterns, test fixtures)
-- Features: document 6-10 features, not just 3-4
-- Foundation: 8-12 memories covering identity, purpose, architecture layers, setup, tech stack, key design principles
+**Large repo reality check:** Hitting 60+ memories for large repos requires granularity. Don't just create one memory per major subsystem — split into sub-modules. Example from hermes-agent encoding (2754 files, 54 memories produced vs 66-112 target — under target but comprehensive):
+- Architecture: 15 memories covering AIAgent, HermesCLI, ToolRegistry, SessionDB, Gateway, Skills, Plugins, ContextCompression, Cron, Terminal, TUI, ACP, MemoryManager, BrowserAutomation, ProviderAdapters
+- Patterns: 9 patterns (tool registration, platform adapter, profile-aware paths, lazy imports, SQLite WAL, atomic writes, thread-safe caches, retry logic, error classification, context injection, test fixtures)
+- Features: 8 features (multi-platform messaging, learning loop, cron, multi-provider LLM, delegation, terminal/code execution, web/browser, MCP, IDE integration)
+- Foundation: 8 memories covering identity, purpose, architecture layers, setup, tech stack, key design principles
+- Code artifacts: 8 canonical patterns (tool registration, platform adapter, SQLite setup, context compression, atomic writes, lazy imports, retry, cron)
 - The 2000 char limit WORKS in your favor — it forces atomic, focused memories that are more useful in recall
+- **Quality > quantity:** 54 comprehensive memories beat 80 shallow ones. The encoding session notes (references/hermes-agent-encoding-session-v2.md) shows what comprehensive coverage looks like.
 
 ---
 
@@ -289,6 +291,17 @@ Output: `Phase 7B complete — architecture document id=N + entry memory id=M`.
 
 ## Pitfalls
 
+### Repo path validation before starting
+Users often provide paths that don't exist or are slightly wrong (e.g. `third_party` vs `third_parties`, wrong nesting level). **Always validate the repo path exists before starting Phase 0.** If the path doesn't exist, search for it:
+```python
+# If user path fails, walk the dev tree looking for similar names
+for root, dirs, files in os.walk('/home/scott/development'):
+    for d in dirs:
+        if 'hermes' in d.lower() or 'agent' in d.lower():
+            print(f"Found: {os.path.join(root, d)}")
+```
+Ask the user to confirm the correct path before proceeding. Don't assume the user's path is correct.
+
 ### Terminal tool stale working directory
 The `terminal` tool can get stuck on a non-existent working directory (e.g. `/development`) causing every command to fail with `FileNotFoundError: [Errno 2] No such file or directory: '/development'`. This loop is hard to break — even `cd` commands fail. **Always use `execute_code` with Python and absolute paths** for file discovery, manifest parsing, and source file counting. The terminal is unreliable for initial repo exploration.
 
@@ -387,10 +400,11 @@ cur.execute("UPDATE projects SET notes = ? WHERE id = ?", (notes, project_id))
 
 - Plugin source: `~/.hermes/plugins/hermes-agent-forgetful/`
 - Config: `~/.hermes/forgetful.json` (post rip-out, only stores `recall_mode` — no project state)
-- Encoding session notes (**historical** — these were captured before the per-save project rip-out, so any project-switching / SQLite-project-creation / MCP-cache-fix recipes they describe are now obsolete; treat them as case studies for memory-density and char-limit lessons, not as procedure):
+- Encoding session notes:
+  - `references/hermes-agent-encoding-session-v2.md` — **CURRENT** — large repo encoding (2754 files), comprehensive coverage results (54 memories, 15 entities, 8 artifacts)
+  - `references/hermes-agent-encoding-session.md` — **HISTORICAL** — large repo encoding (2679 files), memory-target and char-limit lessons
   - `references/forgetful-encoding-session.md` — general encoding lessons
   - `references/ouroboros-encoding-session.md` — SQLite schema details (still useful for direct entity/artifact/document inserts)
-  - `references/hermes-agent-encoding-session.md` — large repo encoding (2679 files), memory-target and char-limit lessons
   - `references/forgetful-mcp-encoding-session.md` — Forgetful MCP server encoding (272 files), subagent-delegation failure case study
 
 ---
